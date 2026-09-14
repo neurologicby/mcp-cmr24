@@ -10,10 +10,10 @@ MCP-сервер предоставляет операции CMR24 в двух �
 ## Быстрый запуск
 
 1. Скопируйте `.env.example` в `.env` и выберите `AUTH_MODE`.
-2. Установите прямые зависимости в Windows:
+2. Установите зафиксированные зависимости в Windows:
 
    ```powershell
-   python -m pip install -r requirements.in
+   python -m pip install --require-hashes -r requirements-windows.lock
    ```
 
 3. Запустите сервер:
@@ -37,11 +37,13 @@ MCP-сервер предоставляет операции CMR24 в двух �
 - `cargo.delete`
 - `cargo.restore`
 
-Заголовки `X-CMR24-Scopes` и `X-CMR24-Caller` принимаются только при `MCP_TRUST_SCOPE_HEADER=true`, то есть после аутентифицирующего reverse proxy. Для внешнего доступа используйте TLS, проверку Host, лимиты запросов и журнал доступа на прокси. Разрешённые Host и Origin задаются `MCP_ALLOWED_HOSTS` и `MCP_ALLOWED_ORIGINS`.
+Заголовки `X-CMR24-Scopes` и `X-CMR24-Caller` принимаются только при `MCP_TRUST_SCOPE_HEADER=true` и совпадении пары `MCP_TRUSTED_PROXY_HEADER` / `MCP_TRUSTED_PROXY_VALUE`. Эта пара должна добавляться аутентифицирующим reverse proxy и не приниматься от внешнего клиента. Для внешнего доступа используйте TLS, проверку Host, лимиты запросов и журнал доступа на прокси. Разрешённые Host и Origin задаются `MCP_ALLOWED_HOSTS` и `MCP_ALLOWED_ORIGINS`; при заданных Origin сервер также включает CORS для MCP-заголовков.
 
 ## Безопасное удаление
 
 Удаление выполняется в два шага. Сначала вызовите `request_delete_confirmation` с ID заявки. Затем передайте полученный короткоживущий `confirmation_token` в `delete_cargo` для того же ID. Токен связан с вызывающим субъектом, операцией и ID и может быть использован только один раз.
+
+При выдаче scope `cargo.delete` обязательно задайте постоянный `CONFIRMATION_SECRET`. Одноразовые подтверждения хранятся в памяти процесса, поэтому текущая реализация рассчитана на один экземпляр приложения. Для нескольких процессов или реплик требуется общее хранилище подтверждений.
 
 ## Результаты операций
 
@@ -78,10 +80,22 @@ python -m tests.load_test --requests 5000 --concurrency 100
 
 Для контрактных smoke-тестов реального API используйте только архивный endpoint `add-cargo-in-archive` и отдельный тестовый аккаунт.
 
+## Production checklist
+
+- публикуйте приложение только через TLS reverse proxy;
+- ограничьте размер тела, частоту запросов и число одновременных соединений на proxy/ingress;
+- задайте точные `MCP_ALLOWED_HOSTS` и `MCP_ALLOWED_ORIGINS`;
+- оставьте `MCP_TRUST_SCOPE_HEADER=false`, если перед сервером нет аутентифицирующего прокси;
+- используйте отдельный CMR24 service account с минимальными правами;
+- запускайте один экземпляр приложения, пока подтверждения удаления не перенесены в общее хранилище;
+- подключите сбор `/metrics` и централизованное хранение JSON-журналов;
+- перед обновлением production выполняйте CI и контрактный smoke-тест архивного endpoint.
+
 ## Обновление зависимостей
 
-`requirements.in` содержит прямые версии и подходит для локальной разработки, включая Windows. `requirements.lock` — полный Linux lock с SHA-256 хэшами для Docker-образа. После осознанного обновления версии пересоберите lock:
+`requirements.in` содержит прямые версии. `requirements.lock` — полный Linux lock с SHA-256 хэшами для Docker-образа, а `requirements-windows.lock` — эквивалентный Windows lock. После осознанного обновления версии пересоберите оба файла:
 
 ```powershell
 uv pip compile requirements.in --generate-hashes --python-version 3.13 --python-platform x86_64-unknown-linux-gnu --output-file requirements.lock
+uv pip compile requirements.in --generate-hashes --python-version 3.13 --python-platform windows --output-file requirements-windows.lock
 ```

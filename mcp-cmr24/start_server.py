@@ -3,14 +3,19 @@
 from __future__ import annotations
 
 import hashlib
+import hmac
 import ipaddress
+import re
+import time
 import uuid
+from collections import OrderedDict
 from contextlib import asynccontextmanager
 
 import uvicorn
 from mcp.server.transport_security import TransportSecuritySettings
 from starlette.applications import Starlette
 from starlette.middleware.base import BaseHTTPMiddleware
+from starlette.middleware.cors import CORSMiddleware
 from starlette.requests import Request
 from starlette.responses import JSONResponse, PlainTextResponse
 from starlette.routing import Route
@@ -29,11 +34,7 @@ configure_logging()
 
 
 def _allowed_service_request(request: Request, config: Settings) -> bool:
-    if (
-        config.trusted_proxy_header
-        and request.headers.get(config.trusted_proxy_header)
-        == config.trusted_proxy_value
-    ):
+    if _trusted_proxy_request(request, config):
         return True
     if request.client is None:
         return False
@@ -47,16 +48,63 @@ def _allowed_service_request(request: Request, config: Settings) -> bool:
         return False
 
 
+def _trusted_proxy_request(request: Request, config: Settings) -> bool:
+    if not config.trusted_proxy_header or not config.trusted_proxy_value:
+        return False
+    supplied = request.headers.get(config.trusted_proxy_header)
+    return supplied is not None and hmac.compare_digest(
+        supplied, config.trusted_proxy_value
+    )
+
+
+class SlidingWindowRateLimiter:
+    def __init__(self, limit: int, window: int, max_clients: int):
+        self.limit = limit
+        self.window = window
+        self.max_clients = max_clients
+        self._clients: OrderedDict[str, tuple[float, int]] = OrderedDict()
+
+    def allow(self, key: str) -> tuple[bool, int]:
+        now = time.monotonic()
+        started, count = self._clients.get(key, (now, 0))
+        if now - started >= self.window:
+            started, count = now, 0
+        allowed = count < self.limit
+        if allowed:
+            count += 1
+        self._clients[key] = (started, count)
+        self._clients.move_to_end(key)
+        while len(self._clients) > self.max_clients:
+            self._clients.popitem(last=False)
+        retry_after = max(1, int(self.window - (now - started)))
+        return allowed, retry_after
+
+
 class AuthMiddleware(BaseHTTPMiddleware):
     def __init__(self, app, config: Settings | None = None):
         super().__init__(app)
         self.config = config or get_settings()
+        self.rate_limiter = SlidingWindowRateLimiter(
+            self.config.rate_limit_requests,
+            self.config.rate_limit_window,
+            self.config.rate_limit_clients,
+        )
 
     async def dispatch(self, request: Request, call_next):
         if request.url.path in {"/healthz", "/readyz"}:
             return await call_next(request)
         header = request.headers.get("Authorization", "")
-        bearer = header[7:].strip() if header.startswith("Bearer ") else None
+        scheme, separator, credential = header.partition(" ")
+        bearer = (
+            credential.strip()
+            if separator and scheme.casefold() == "bearer" and credential.strip()
+            else None
+        )
+        if bearer and len(bearer) > 4096:
+            return JSONResponse(
+                {"ok": False, "code": "invalid_token", "message": "Invalid token"},
+                status_code=400,
+            )
         if self.config.auth_mode == "per_request" and not bearer:
             return JSONResponse(
                 {
@@ -78,8 +126,11 @@ class AuthMiddleware(BaseHTTPMiddleware):
                 status_code=403,
             )
 
+        trusted_identity = self.config.trust_scope_header and _trusted_proxy_request(
+            request, self.config
+        )
         scopes = self.config.default_scopes
-        if self.config.trust_scope_header:
+        if trusted_identity:
             scopes = tuple(
                 item
                 for item in request.headers.get("X-CMR24-Scopes", "")
@@ -87,18 +138,40 @@ class AuthMiddleware(BaseHTTPMiddleware):
                 .split()
                 if item
             )
-        caller = (
-            request.headers.get("X-CMR24-Caller")
-            if self.config.trust_scope_header
-            else None
-        )
+        caller = request.headers.get("X-CMR24-Caller") if trusted_identity else None
         if not caller:
             caller = (
                 "service-account"
                 if self.config.auth_mode == "service_account"
                 else "token:" + hashlib.sha256(bearer.encode()).hexdigest()[:16]
             )
+        if not re.fullmatch(r"[A-Za-z0-9_.:@-]{1,128}", caller):
+            return JSONResponse(
+                {"ok": False, "code": "invalid_caller", "message": "Invalid caller"},
+                status_code=400,
+            )
+        if trusted_identity:
+            rate_key = f"caller:{caller}"
+        elif request.client is not None:
+            rate_key = f"client:{request.client.host}"
+        else:
+            rate_key = f"caller:{caller}"
+        allowed, retry_after = self.rate_limiter.allow(rate_key)
+        if not allowed:
+            metrics.inc("http_requests_total", result="rate_limited")
+            return JSONResponse(
+                {
+                    "ok": False,
+                    "code": "rate_limited",
+                    "message": "Too many requests",
+                    "retriable": True,
+                },
+                status_code=429,
+                headers={"Retry-After": str(retry_after)},
+            )
         request_id = request.headers.get("X-Request-ID") or uuid.uuid4().hex
+        if not re.fullmatch(r"[A-Za-z0-9_.-]{1,128}", request_id):
+            request_id = uuid.uuid4().hex
 
         auth_token = authkey_var.set(
             bearer if self.config.auth_mode == "per_request" else None
@@ -173,7 +246,27 @@ app = Starlette(
     ],
     lifespan=lifespan,
 )
-app.add_middleware(AuthMiddleware, config=settings)
+
+
+def add_http_middlewares(application: Starlette, config: Settings) -> None:
+    application.add_middleware(AuthMiddleware, config=config)
+    if config.allowed_origins:
+        application.add_middleware(
+            CORSMiddleware,
+            allow_origins=list(config.allowed_origins),
+            allow_methods=["GET", "POST", "DELETE", "OPTIONS"],
+            allow_headers=[
+                "Authorization",
+                "Content-Type",
+                "Mcp-Protocol-Version",
+                "Mcp-Session-Id",
+                "X-Request-ID",
+            ],
+            expose_headers=["Mcp-Session-Id", "X-Request-ID"],
+        )
+
+
+add_http_middlewares(app, settings)
 
 
 if __name__ == "__main__":

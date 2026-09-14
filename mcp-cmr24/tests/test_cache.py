@@ -40,3 +40,13 @@ class CacheTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(calls, 1)
         self.assertEqual(values, ["value"] * 20)
+        self.assertEqual(cache._inflight, {})
+
+    async def test_unique_keys_do_not_leave_coordination_state(self):
+        cache = AsyncTTLCache(maxsize=2, ttl=60)
+        for index in range(100):
+            await cache.get_or_create(
+                f"city:{index}", lambda value=index: asyncio.sleep(0, result=value)
+            )
+        self.assertEqual(cache.size, 2)
+        self.assertEqual(cache._inflight, {})

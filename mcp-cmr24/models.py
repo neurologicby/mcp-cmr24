@@ -14,6 +14,7 @@ from pydantic import (
     field_validator,
     model_validator,
 )
+from pydantic_core import PydanticCustomError
 
 
 def parse_date(value: str) -> date:
@@ -166,6 +167,17 @@ class EmployeeDeleteParams(InputModel):
 class CargoListResponse(RootModel[dict[str, object] | list[object]]):
     """Supported top-level shapes returned by the cargo list endpoint."""
 
+    @model_validator(mode="after")
+    def supported_shape(self) -> CargoListResponse:
+        if isinstance(self.root, list):
+            return self
+        cargo = self.root.get("Cargo")
+        if not isinstance(cargo, (list, dict)):
+            raise PydanticCustomError(
+                "cargo_list_shape", "Ответ списка должен содержать коллекцию Cargo"
+            )
+        return self
+
 
 class MutationResponse(BaseModel):
     """Typed confirmation fields shared by create, edit, delete and restore endpoints."""
@@ -180,8 +192,22 @@ class MutationResponse(BaseModel):
     )
     affected: int | None = Field(
         default=None,
+        ge=0,
         validation_alias=AliasChoices("affected", "updated", "deleted", "restored"),
     )
+
+    @field_validator("item_id")
+    @classmethod
+    def valid_item_id(cls, value: int | str | None) -> int | str | None:
+        if value is None:
+            return None
+        if isinstance(value, bool) or isinstance(value, int) and value <= 0:
+            raise ValueError("ID изменённого объекта должен быть положительным")
+        if isinstance(value, str):
+            value = value.strip()
+            if not value or value == "0":
+                raise ValueError("ID изменённого объекта не может быть пустым")
+        return value
 
     @property
     def confirmed(self) -> bool:

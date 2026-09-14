@@ -1,1 +1,1 @@
--r requirements.lock
+-r requirements.in

@@ -7,6 +7,7 @@ import os
 from functools import lru_cache
 from pathlib import Path
 from typing import Literal
+from urllib.parse import urlsplit
 
 from dotenv import load_dotenv
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
@@ -45,6 +46,9 @@ class Settings(BaseModel):
     matcher_margin: float = Field(default=0.08, ge=0, le=1)
     confirmation_ttl: int = Field(default=180, ge=10, le=900)
     confirmation_secret: str | None = None
+    rate_limit_requests: int = Field(default=120, ge=1, le=100_000)
+    rate_limit_window: int = Field(default=60, ge=1, le=3600)
+    rate_limit_clients: int = Field(default=10_000, ge=100, le=1_000_000)
 
     @field_validator("base_url")
     @classmethod
@@ -52,7 +56,30 @@ class Settings(BaseModel):
         value = value.strip().rstrip("/")
         if not value.startswith(("https://", "http://")):
             raise ValueError("CMR24_BASE_URL must use http or https")
+        parsed = urlsplit(value)
+        if parsed.scheme == "http" and parsed.hostname not in {
+            "127.0.0.1",
+            "::1",
+            "localhost",
+        }:
+            raise ValueError("CMR24_BASE_URL must use https outside localhost")
         return value
+
+    @field_validator("allowed_hosts", "allowed_origins")
+    @classmethod
+    def reject_wildcard_allowlists(cls, values: tuple[str, ...]) -> tuple[str, ...]:
+        if "*" in values:
+            raise ValueError("Wildcard Host and Origin allowlists are not permitted")
+        return values
+
+    @field_validator("default_scopes")
+    @classmethod
+    def validate_scopes(cls, values: tuple[str, ...]) -> tuple[str, ...]:
+        known = {"cargo.read", "cargo.write", "cargo.delete", "cargo.restore", "*"}
+        unknown = set(values) - known
+        if unknown:
+            raise ValueError(f"Unknown scopes: {', '.join(sorted(unknown))}")
+        return values
 
     @field_validator("service_account_networks")
     @classmethod
@@ -68,6 +95,16 @@ class Settings(BaseModel):
         if bool(self.trusted_proxy_header) != bool(self.trusted_proxy_value):
             raise ValueError(
                 "Both MCP_TRUSTED_PROXY_HEADER and MCP_TRUSTED_PROXY_VALUE are required"
+            )
+        if self.trust_scope_header and not self.trusted_proxy_header:
+            raise ValueError(
+                "MCP_TRUST_SCOPE_HEADER requires an authenticated trusted proxy"
+            )
+        if (
+            "cargo.delete" in self.default_scopes or "*" in self.default_scopes
+        ) and not self.confirmation_secret:
+            raise ValueError(
+                "CONFIRMATION_SECRET is required when cargo.delete is enabled"
             )
         return self
 
@@ -99,6 +136,9 @@ class Settings(BaseModel):
             matcher_margin=os.getenv("MATCHER_MARGIN", "0.08"),
             confirmation_ttl=os.getenv("CONFIRMATION_TTL", "180"),
             confirmation_secret=os.getenv("CONFIRMATION_SECRET"),
+            rate_limit_requests=os.getenv("MCP_RATE_LIMIT_REQUESTS", "120"),
+            rate_limit_window=os.getenv("MCP_RATE_LIMIT_WINDOW", "60"),
+            rate_limit_clients=os.getenv("MCP_RATE_LIMIT_CLIENTS", "10000"),
         )
 
 

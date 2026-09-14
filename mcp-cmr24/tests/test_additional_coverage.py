@@ -19,7 +19,14 @@ from auth_context import caller_id_var, caller_scopes_var
 from confirmations import ConfirmationManager
 from errors import AppError
 from metrics import Metrics
-from models import CargoEditParams, CargoIdParams, EmployeeParams, parse_date
+from models import (
+    CargoEditParams,
+    CargoIdParams,
+    CargoListResponse,
+    EmployeeParams,
+    MutationResponse,
+    parse_date,
+)
 from reference_service import ReferenceService, set_reference_service
 from settings import Settings
 
@@ -83,6 +90,19 @@ class SettingsAndModelsExtraTests(unittest.TestCase):
             Settings(service_account_networks=("bad-network",))
         with self.assertRaises(ValidationError):
             Settings(trusted_proxy_header="X-Gateway")
+        with self.assertRaises(ValidationError):
+            Settings(trust_scope_header=True)
+        with self.assertRaises(ValidationError):
+            Settings(default_scopes=("cargo.delete",))
+        with self.assertRaises(ValidationError):
+            Settings(base_url="http://cmr24.example")
+        with self.assertRaises(ValidationError):
+            Settings(allowed_hosts=("*",))
+        with self.assertRaises(ValidationError):
+            Settings(default_scopes=("cargo.admin",))
+        self.assertEqual(
+            Settings(base_url="http://localhost:8080").base_url, "http://localhost:8080"
+        )
 
     def test_model_edge_cases(self):
         with self.assertRaises(ValueError):
@@ -96,6 +116,12 @@ class SettingsAndModelsExtraTests(unittest.TestCase):
         self.assertEqual(
             EmployeeParams(phone="+375 (29) 123-45-67").phone, "+375291234567"
         )
+        with self.assertRaises(ValidationError):
+            CargoListResponse.model_validate({"message": "not a cargo list"})
+        with self.assertRaises(ValidationError):
+            MutationResponse.model_validate({"id": ""})
+        with self.assertRaises(ValidationError):
+            MutationResponse.model_validate({"id": 0})
 
 
 class ConfirmationExtraTests(unittest.TestCase):
@@ -168,6 +194,27 @@ class ReferenceAndResourceTests(unittest.IsolatedAsyncioTestCase):
         finally:
             set_reference_service(None)
 
+    async def test_invalid_reference_response_is_not_cached(self):
+        class API:
+            def __init__(self):
+                self.calls = 0
+
+            async def request(self, endpoint, **kwargs):
+                self.calls += 1
+                return {"error": "temporary failure"}
+
+        api = API()
+        service = ReferenceService(
+            Settings(reference_cache_size=2, reference_cache_ttl=60)
+        )
+        with patch.object(reference_service, "get_api_client", return_value=api):
+            for _ in range(2):
+                with self.assertRaises(AppError) as context:
+                    await service.get("load_types")
+                self.assertEqual(context.exception.code, "upstream_application_error")
+        self.assertEqual(api.calls, 2)
+        self.assertEqual(service.cache.size, 0)
+
 
 class ServerAndMetricsTests(unittest.IsolatedAsyncioTestCase):
     async def test_service_mode_network_boundary(self):
@@ -200,6 +247,94 @@ class ServerAndMetricsTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual((await start_server.readiness(request)).status_code, 200)
         response = await start_server.prometheus(request)
         self.assertIn("cmr24_", response.body.decode())
+
+    async def test_scope_headers_require_authenticated_proxy(self):
+        async def endpoint(request):
+            return JSONResponse(
+                {
+                    "scopes": sorted(caller_scopes_var.get()),
+                    "caller": start_server.caller_id_var.get(),
+                }
+            )
+
+        app = Starlette(routes=[Route("/x", endpoint)])
+        app.add_middleware(
+            start_server.AuthMiddleware,
+            config=Settings(
+                trust_scope_header=True,
+                trusted_proxy_header="X-Gateway-Secret",
+                trusted_proxy_value="expected",
+                default_scopes=("cargo.read",),
+            ),
+        )
+        transport = httpx.ASGITransport(app=app)
+        base_headers = {
+            "Authorization": "Bearer key",
+            "X-CMR24-Scopes": "cargo.delete",
+            "X-CMR24-Caller": "admin",
+        }
+        async with httpx.AsyncClient(
+            transport=transport, base_url="http://test"
+        ) as client:
+            untrusted = await client.get("/x", headers=base_headers)
+            trusted = await client.get(
+                "/x",
+                headers={**base_headers, "X-Gateway-Secret": "expected"},
+            )
+        self.assertEqual(untrusted.json()["scopes"], ["cargo.read"])
+        self.assertNotEqual(untrusted.json()["caller"], "admin")
+        self.assertEqual(trusted.json()["scopes"], ["cargo.delete"])
+        self.assertEqual(trusted.json()["caller"], "admin")
+
+    async def test_rate_limit_and_case_insensitive_bearer_scheme(self):
+        async def endpoint(request):
+            return JSONResponse({"ok": True})
+
+        app = Starlette(routes=[Route("/x", endpoint)])
+        app.add_middleware(
+            start_server.AuthMiddleware,
+            config=Settings(rate_limit_requests=1, rate_limit_window=60),
+        )
+        transport = httpx.ASGITransport(app=app)
+        async with httpx.AsyncClient(
+            transport=transport, base_url="http://test"
+        ) as client:
+            first = await client.get("/x", headers={"Authorization": "bearer same-key"})
+            second = await client.get(
+                "/x", headers={"Authorization": "Bearer same-key"}
+            )
+        self.assertEqual(first.status_code, 200)
+        self.assertEqual(second.status_code, 429)
+        self.assertIn("Retry-After", second.headers)
+
+    async def test_cors_preflight_allows_mcp_headers(self):
+        async def endpoint(request):
+            return JSONResponse({"ok": True})
+
+        app = Starlette(routes=[Route("/mcp", endpoint, methods=["POST"])])
+        start_server.add_http_middlewares(
+            app,
+            Settings(allowed_origins=("https://client.example",)),
+        )
+        transport = httpx.ASGITransport(app=app)
+        async with httpx.AsyncClient(
+            transport=transport, base_url="http://test"
+        ) as client:
+            response = await client.options(
+                "/mcp",
+                headers={
+                    "Origin": "https://client.example",
+                    "Access-Control-Request-Method": "POST",
+                    "Access-Control-Request-Headers": (
+                        "Authorization,Mcp-Protocol-Version,Mcp-Session-Id"
+                    ),
+                },
+            )
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(
+            response.headers["Access-Control-Allow-Origin"],
+            "https://client.example",
+        )
 
     def test_metrics_export(self):
         metrics = Metrics()

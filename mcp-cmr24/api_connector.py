@@ -66,7 +66,13 @@ class CMR24Client:
         form_prefix: str | None = None,
     ) -> Any:
         await self.start()
-        assert self._client is not None
+        if self._client is None:  # Defensive guard for unusual lifecycle races.
+            raise AppError(
+                "client_unavailable",
+                "HTTP-клиент CMR24 не инициализирован",
+                retriable=True,
+                status_code=503,
+            )
         method = method.upper()
         if method not in {"GET", "POST"}:
             raise AppError("invalid_method", "Неподдерживаемый HTTP метод")

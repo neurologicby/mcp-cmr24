@@ -1,6 +1,6 @@
 # CMR24 MCP Server
 
-Public release **0.0.1** of an MCP server for working with the CMR24 cargo API.
+Public release **0.1.0** of an MCP server for working with the CMR24 cargo API.
 
 The server provides two MCP interfaces over one operation registry:
 
@@ -15,7 +15,7 @@ commands are in [`mcp-cmr24/README.md`](mcp-cmr24/README.md).
 ```powershell
 cd mcp-cmr24
 Copy-Item .env.example .env
-python -m pip install -r requirements.in
+python -m pip install --require-hashes -r requirements-windows.lock
 python start_server.py
 ```
 
