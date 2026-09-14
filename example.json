@@ -1,0 +1,11 @@
+{
+  "mcpServers": {
+    "cmr24": {
+      "type": "http",
+      "url": "http://127.0.0.1:8000/mcp/single",
+      "headers": {
+        "Authorization": "Bearer ${CMR24_AUTHKEY}"
+      }
+    }
+  }
+}
